@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 from dataclasses import dataclass
 from typing import Any
 
@@ -26,9 +27,12 @@ _VALUE_COLUMNS = {"TEXT": "value_text", "INTEGER": "value_integer", "DECIMAL": "
 _ACQUISITION_MODES = {"MANUAL", "AUTOMATIC", "MIGRATED_LEGACY"}
 
 
-def get_information(entity_id: int, field_code: str) -> EntityInformationWithOrigins | None:
+def get_information(entity_id: int, field_code: str, *, connection: sqlite3.Connection | None = None) -> EntityInformationWithOrigins | None:
     """Read one current value and all retained provenance records for it."""
     clean_code = _field_code(field_code)
+    if connection is not None:
+        information = _get_information(connection, entity_id, clean_code)
+        return _with_origins(connection, information) if information else None
     connection = connect()
     try:
         information = _get_information(connection, entity_id, clean_code)
@@ -36,53 +40,44 @@ def get_information(entity_id: int, field_code: str) -> EntityInformationWithOri
     finally: connection.close()
 
 
-def list_entity_information(entity_id: int) -> tuple[EntityInformationWithOrigins, ...]:
+def list_entity_information(entity_id: int, *, connection: sqlite3.Connection | None = None) -> tuple[EntityInformationWithOrigins, ...]:
     """Read all current values, each with its provenance history."""
+    if connection is not None:
+        return _list_entity_information(connection, entity_id)
     connection = connect()
     try:
-        _require_entity(connection, entity_id)
-        rows = connection.execute("SELECT * FROM entity_information WHERE entity_id = ? ORDER BY field_code", (entity_id,)).fetchall()
-        return tuple(_with_origins(connection, EntityInformation.from_row(row)) for row in rows)
+        return _list_entity_information(connection, entity_id)
     finally: connection.close()
 
 
-def set_information(*, entity_id: int, field_code: str, value_type: str, value: Any, acquisition_mode: str, universe_source_id: int | None = None, external_id_snapshot: str | None = None, external_url_snapshot: str | None = None, expected_universe_id: int | None = None) -> EntityInformationWithOrigins:
+def set_information(*, entity_id: int, field_code: str, value_type: str, value: Any, acquisition_mode: str, universe_source_id: int | None = None, external_id_snapshot: str | None = None, external_url_snapshot: str | None = None, expected_universe_id: int | None = None, connection: sqlite3.Connection | None = None) -> EntityInformationWithOrigins:
     """Create a new current value. Existing values require explicit replacement."""
     clean_code, clean_type = _field_code(field_code), _value_type(value_type)
-    with transaction() as connection:
-        entity_universe = _require_entity(connection, entity_id)
-        _validate_expected_universe(entity_universe, expected_universe_id)
-        if _get_information(connection, entity_id, clean_code):
-            raise EntityInformationAlreadyExistsError("Information already exists; use replace_information explicitly.")
-        _validate_provenance(connection, entity_universe, acquisition_mode, universe_source_id)
-        values = _value_columns(clean_type, value)
-        cursor = connection.execute(
-            "INSERT INTO entity_information (entity_id, field_code, value_type, value_text, value_integer, value_decimal, value_date, value_json, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
-            (entity_id, clean_code, clean_type, values["value_text"], values["value_integer"], values["value_decimal"], values["value_date"], values["value_json"]),
+    if connection is not None:
+        return _set_information(
+            connection, entity_id, clean_code, clean_type, value, acquisition_mode,
+            universe_source_id, external_id_snapshot, external_url_snapshot, expected_universe_id,
         )
-        information = _require_information(connection, cursor.lastrowid)
-        _insert_origin(connection, information, acquisition_mode, universe_source_id, external_id_snapshot, external_url_snapshot)
-        return _with_origins(connection, information)
+    with transaction() as transaction_connection:
+        return _set_information(
+            transaction_connection, entity_id, clean_code, clean_type, value, acquisition_mode,
+            universe_source_id, external_id_snapshot, external_url_snapshot, expected_universe_id,
+        )
 
 
-def replace_information(*, entity_id: int, field_code: str, value_type: str, value: Any, acquisition_mode: str, universe_source_id: int | None = None, external_id_snapshot: str | None = None, external_url_snapshot: str | None = None, expected_universe_id: int | None = None) -> EntityInformationWithOrigins:
+def replace_information(*, entity_id: int, field_code: str, value_type: str, value: Any, acquisition_mode: str, universe_source_id: int | None = None, external_id_snapshot: str | None = None, external_url_snapshot: str | None = None, expected_universe_id: int | None = None, connection: sqlite3.Connection | None = None) -> EntityInformationWithOrigins:
     """Explicitly replace the current value and append its new provenance record."""
     clean_code, clean_type = _field_code(field_code), _value_type(value_type)
-    with transaction() as connection:
-        entity_universe = _require_entity(connection, entity_id)
-        _validate_expected_universe(entity_universe, expected_universe_id)
-        information = _get_information(connection, entity_id, clean_code)
-        if information is None:
-            raise EntityInformationNotFoundError("Information does not exist; use set_information first.")
-        _validate_provenance(connection, entity_universe, acquisition_mode, universe_source_id)
-        values = _value_columns(clean_type, value)
-        connection.execute(
-            "UPDATE entity_information SET value_type = ?, value_text = ?, value_integer = ?, value_decimal = ?, value_date = ?, value_json = ?, updated_at = CURRENT_TIMESTAMP WHERE entity_information_id = ?",
-            (clean_type, values["value_text"], values["value_integer"], values["value_decimal"], values["value_date"], values["value_json"], information.entity_information_id),
+    if connection is not None:
+        return _replace_information(
+            connection, entity_id, clean_code, clean_type, value, acquisition_mode,
+            universe_source_id, external_id_snapshot, external_url_snapshot, expected_universe_id,
         )
-        current = _require_information(connection, information.entity_information_id)
-        _insert_origin(connection, current, acquisition_mode, universe_source_id, external_id_snapshot, external_url_snapshot)
-        return _with_origins(connection, current)
+    with transaction() as transaction_connection:
+        return _replace_information(
+            transaction_connection, entity_id, clean_code, clean_type, value, acquisition_mode,
+            universe_source_id, external_id_snapshot, external_url_snapshot, expected_universe_id,
+        )
 
 
 def _with_origins(connection, information: EntityInformation) -> EntityInformationWithOrigins:
@@ -93,6 +88,67 @@ def _with_origins(connection, information: EntityInformation) -> EntityInformati
 def _get_information(connection, entity_id: int, field_code: str) -> EntityInformation | None:
     row = connection.execute("SELECT * FROM entity_information WHERE entity_id = ? AND field_code = ?", (entity_id, field_code)).fetchone()
     return EntityInformation.from_row(row) if row else None
+
+
+def _list_entity_information(connection: sqlite3.Connection, entity_id: int) -> tuple[EntityInformationWithOrigins, ...]:
+    _require_entity(connection, entity_id)
+    rows = connection.execute("SELECT * FROM entity_information WHERE entity_id = ? ORDER BY field_code", (entity_id,)).fetchall()
+    return tuple(_with_origins(connection, EntityInformation.from_row(row)) for row in rows)
+
+
+def _set_information(
+    connection: sqlite3.Connection,
+    entity_id: int,
+    field_code: str,
+    value_type: str,
+    value: Any,
+    acquisition_mode: str,
+    universe_source_id: int | None,
+    external_id_snapshot: str | None,
+    external_url_snapshot: str | None,
+    expected_universe_id: int | None,
+) -> EntityInformationWithOrigins:
+    entity_universe = _require_entity(connection, entity_id)
+    _validate_expected_universe(entity_universe, expected_universe_id)
+    if _get_information(connection, entity_id, field_code):
+        raise EntityInformationAlreadyExistsError("Information already exists; use replace_information explicitly.")
+    _validate_provenance(connection, entity_universe, acquisition_mode, universe_source_id)
+    values = _value_columns(value_type, value)
+    cursor = connection.execute(
+        "INSERT INTO entity_information (entity_id, field_code, value_type, value_text, value_integer, value_decimal, value_date, value_json, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
+        (entity_id, field_code, value_type, values["value_text"], values["value_integer"], values["value_decimal"], values["value_date"], values["value_json"]),
+    )
+    information = _require_information(connection, cursor.lastrowid)
+    _insert_origin(connection, information, acquisition_mode, universe_source_id, external_id_snapshot, external_url_snapshot)
+    return _with_origins(connection, information)
+
+
+def _replace_information(
+    connection: sqlite3.Connection,
+    entity_id: int,
+    field_code: str,
+    value_type: str,
+    value: Any,
+    acquisition_mode: str,
+    universe_source_id: int | None,
+    external_id_snapshot: str | None,
+    external_url_snapshot: str | None,
+    expected_universe_id: int | None,
+) -> EntityInformationWithOrigins:
+    entity_universe = _require_entity(connection, entity_id)
+    _validate_expected_universe(entity_universe, expected_universe_id)
+    information = _get_information(connection, entity_id, field_code)
+    if information is None:
+        raise EntityInformationNotFoundError("Information does not exist; use set_information first.")
+    _validate_provenance(connection, entity_universe, acquisition_mode, universe_source_id)
+    values = _value_columns(value_type, value)
+    connection.execute(
+        "UPDATE entity_information SET value_type = ?, value_text = ?, value_integer = ?, value_decimal = ?, value_date = ?, value_json = ?, updated_at = CURRENT_TIMESTAMP WHERE entity_information_id = ?",
+        (value_type, values["value_text"], values["value_integer"], values["value_decimal"], values["value_date"], values["value_json"], information.entity_information_id),
+    )
+    current = _require_information(connection, information.entity_information_id)
+    _insert_origin(connection, current, acquisition_mode, universe_source_id, external_id_snapshot, external_url_snapshot)
+    return _with_origins(connection, current)
 
 
 def _require_information(connection, information_id: int) -> EntityInformation:

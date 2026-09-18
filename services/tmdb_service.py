@@ -6,6 +6,7 @@ import os
 import re
 import json
 from dataclasses import dataclass
+from datetime import date
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
@@ -62,6 +63,8 @@ class TmdbMovieDetails:
     genres: tuple[str, ...]
     directors: tuple[str, ...]
     cast: tuple[TmdbCastMember, ...]
+    runtime_minutes: int | None
+    fr_release_date: str | None
 
 
 def search_movies(query: str, *, year: int | str | None = None, limit: int = _DEFAULT_LIMIT) -> tuple[TmdbCandidate, ...]:
@@ -109,13 +112,17 @@ def match_entity(entity: EntityMatchInput, *, limit: int = _DEFAULT_LIMIT) -> tu
 
 
 def get_movie_details(tmdb_id: int | str, *, cast_limit: int = _DEFAULT_LIMIT) -> TmdbMovieDetails:
-    """Read localized movie details and TMDB credits without persisting anything."""
+    """Read localized movie details, credits and French release data without persisting anything."""
     clean_id = _tmdb_id(tmdb_id)
     if not 1 <= cast_limit <= _MAX_LIMIT:
         raise ValueError(f"cast_limit must be between 1 and {_MAX_LIMIT}.")
     payload = _request_json(
         _MOVIE_DETAILS_URL.format(tmdb_id=clean_id),
-        {"api_key": _get_api_key(), "language": "fr-FR", "append_to_response": "credits"},
+        {
+            "api_key": _get_api_key(),
+            "language": "fr-FR",
+            "append_to_response": "credits,release_dates",
+        },
     )
     if payload.get("id") is None:
         raise TmdbResponseError("TMDB returned movie details without an identifier.")
@@ -139,6 +146,8 @@ def get_movie_details(tmdb_id: int | str, *, cast_limit: int = _DEFAULT_LIMIT) -
         genres=genres,
         directors=directors,
         cast=cast,
+        runtime_minutes=_runtime_minutes(payload.get("runtime")),
+        fr_release_date=_french_release_date(payload.get("release_dates")),
     )
 
 
@@ -180,6 +189,41 @@ def _year(value: int | str | None) -> int | None:
 
 def _text_or_none(value: object) -> str | None:
     return value if isinstance(value, str) and value else None
+
+
+def _runtime_minutes(value: object) -> int | None:
+    """Return TMDB's positive runtime in minutes, when it is usable."""
+
+    return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else None
+
+
+def _french_release_date(value: object) -> str | None:
+    """Return the earliest valid calendar date declared by TMDB for France.
+
+    TMDB can return several French release events.  This client does not infer
+    a release type: it selects the earliest valid French date and returns its
+    ISO calendar portion.  ``None`` means that TMDB did not provide a usable
+    French date; callers must not silently replace it with the general date.
+    """
+
+    if not isinstance(value, dict) or not isinstance(value.get("results"), list):
+        return None
+    french_dates: list[date] = []
+    for country in value["results"]:
+        if not isinstance(country, dict) or country.get("iso_3166_1") != "FR":
+            continue
+        releases = country.get("release_dates")
+        if not isinstance(releases, list):
+            continue
+        for release in releases:
+            raw_date = release.get("release_date") if isinstance(release, dict) else None
+            if not isinstance(raw_date, str):
+                continue
+            try:
+                french_dates.append(date.fromisoformat(raw_date[:10]))
+            except ValueError:
+                continue
+    return min(french_dates).isoformat() if french_dates else None
 
 
 def _tmdb_id(value: int | str) -> str:

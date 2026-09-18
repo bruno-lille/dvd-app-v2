@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import sqlite3
 
 from database.db_manager import connect, transaction
 
@@ -24,50 +25,80 @@ class EntityExternalReference:
     created_at: str
 
 
-def get_external_reference(entity_id: int, universe_source_id: int) -> EntityExternalReference | None:
+def get_external_reference(entity_id: int, universe_source_id: int, *, connection: sqlite3.Connection | None = None) -> EntityExternalReference | None:
+    """Read a reference, optionally through a caller-owned connection."""
+    if connection is not None:
+        return _get_reference(connection, entity_id, universe_source_id)
     connection = connect()
     try: return _get_reference(connection, entity_id, universe_source_id)
     finally: connection.close()
 
 
-def list_external_references(entity_id: int) -> tuple[EntityExternalReference, ...]:
+def list_external_references(entity_id: int, *, connection: sqlite3.Connection | None = None) -> tuple[EntityExternalReference, ...]:
+    """List references, optionally through a caller-owned connection."""
+    if connection is not None:
+        return _list_external_references(connection, entity_id)
     connection = connect()
     try:
-        _require_entity_universe(connection, entity_id)
-        rows = connection.execute("SELECT * FROM entity_external_reference WHERE entity_id = ? ORDER BY universe_source_id, entity_external_reference_id", (entity_id,)).fetchall()
-        return tuple(_from_row(row) for row in rows)
+        return _list_external_references(connection, entity_id)
     finally: connection.close()
 
 
-def set_external_reference(*, entity_id: int, universe_source_id: int, external_id: str, external_url: str | None = None, last_retrieved_at: str | None = None) -> EntityExternalReference:
+def set_external_reference(*, entity_id: int, universe_source_id: int, external_id: str, external_url: str | None = None, last_retrieved_at: str | None = None, connection: sqlite3.Connection | None = None) -> EntityExternalReference:
     """Create one explicit current reference; never overwrite an existing source link."""
     clean_id = _external_id(external_id)
-    with transaction() as connection:
-        entity_universe = _require_entity_universe(connection, entity_id)
-        _require_universe_source(connection, universe_source_id, entity_universe)
-        if _get_reference(connection, entity_id, universe_source_id):
-            raise EntityExternalReferenceAlreadyExistsError("External reference already exists; use replace_external_reference explicitly.")
-        _ensure_external_id_available(connection, universe_source_id, clean_id)
-        cursor = connection.execute("INSERT INTO entity_external_reference (entity_id, universe_source_id, external_id, external_url, last_retrieved_at, created_at) VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)", (entity_id, universe_source_id, clean_id, _empty_to_none(external_url), last_retrieved_at))
-        return _require_reference_by_id(connection, cursor.lastrowid)
+    if connection is not None:
+        return _set_external_reference(
+            connection, entity_id, universe_source_id, clean_id, external_url, last_retrieved_at
+        )
+    with transaction() as transaction_connection:
+        return _set_external_reference(
+            transaction_connection, entity_id, universe_source_id, clean_id, external_url, last_retrieved_at
+        )
 
 
-def replace_external_reference(*, entity_id: int, universe_source_id: int, external_id: str, external_url: str | None = None, last_retrieved_at: str | None = None) -> EntityExternalReference:
+def replace_external_reference(*, entity_id: int, universe_source_id: int, external_id: str, external_url: str | None = None, last_retrieved_at: str | None = None, connection: sqlite3.Connection | None = None) -> EntityExternalReference:
     """Explicitly replace an existing external identifier for the same source."""
     clean_id = _external_id(external_id)
-    with transaction() as connection:
-        entity_universe = _require_entity_universe(connection, entity_id)
-        _require_universe_source(connection, universe_source_id, entity_universe)
-        reference = _get_reference(connection, entity_id, universe_source_id)
-        if reference is None: raise EntityExternalReferenceNotFoundError("External reference does not exist; use set_external_reference first.")
-        _ensure_external_id_available(connection, universe_source_id, clean_id, excluded_reference_id=reference.entity_external_reference_id)
-        connection.execute("UPDATE entity_external_reference SET external_id = ?, external_url = ?, last_retrieved_at = ? WHERE entity_external_reference_id = ?", (clean_id, _empty_to_none(external_url), last_retrieved_at, reference.entity_external_reference_id))
-        return _require_reference_by_id(connection, reference.entity_external_reference_id)
+    if connection is not None:
+        return _replace_external_reference(
+            connection, entity_id, universe_source_id, clean_id, external_url, last_retrieved_at
+        )
+    with transaction() as transaction_connection:
+        return _replace_external_reference(
+            transaction_connection, entity_id, universe_source_id, clean_id, external_url, last_retrieved_at
+        )
 
 
 def _get_reference(connection, entity_id: int, universe_source_id: int) -> EntityExternalReference | None:
     row = connection.execute("SELECT * FROM entity_external_reference WHERE entity_id = ? AND universe_source_id = ? ORDER BY entity_external_reference_id LIMIT 1", (entity_id, universe_source_id)).fetchone()
     return _from_row(row) if row else None
+
+
+def _list_external_references(connection: sqlite3.Connection, entity_id: int) -> tuple[EntityExternalReference, ...]:
+    _require_entity_universe(connection, entity_id)
+    rows = connection.execute("SELECT * FROM entity_external_reference WHERE entity_id = ? ORDER BY universe_source_id, entity_external_reference_id", (entity_id,)).fetchall()
+    return tuple(_from_row(row) for row in rows)
+
+
+def _set_external_reference(connection: sqlite3.Connection, entity_id: int, universe_source_id: int, external_id: str, external_url: str | None, last_retrieved_at: str | None) -> EntityExternalReference:
+    entity_universe = _require_entity_universe(connection, entity_id)
+    _require_universe_source(connection, universe_source_id, entity_universe)
+    if _get_reference(connection, entity_id, universe_source_id):
+        raise EntityExternalReferenceAlreadyExistsError("External reference already exists; use replace_external_reference explicitly.")
+    _ensure_external_id_available(connection, universe_source_id, external_id)
+    cursor = connection.execute("INSERT INTO entity_external_reference (entity_id, universe_source_id, external_id, external_url, last_retrieved_at, created_at) VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)", (entity_id, universe_source_id, external_id, _empty_to_none(external_url), last_retrieved_at))
+    return _require_reference_by_id(connection, cursor.lastrowid)
+
+
+def _replace_external_reference(connection: sqlite3.Connection, entity_id: int, universe_source_id: int, external_id: str, external_url: str | None, last_retrieved_at: str | None) -> EntityExternalReference:
+    entity_universe = _require_entity_universe(connection, entity_id)
+    _require_universe_source(connection, universe_source_id, entity_universe)
+    reference = _get_reference(connection, entity_id, universe_source_id)
+    if reference is None: raise EntityExternalReferenceNotFoundError("External reference does not exist; use set_external_reference first.")
+    _ensure_external_id_available(connection, universe_source_id, external_id, excluded_reference_id=reference.entity_external_reference_id)
+    connection.execute("UPDATE entity_external_reference SET external_id = ?, external_url = ?, last_retrieved_at = ? WHERE entity_external_reference_id = ?", (external_id, _empty_to_none(external_url), last_retrieved_at, reference.entity_external_reference_id))
+    return _require_reference_by_id(connection, reference.entity_external_reference_id)
 
 
 def _from_row(row) -> EntityExternalReference:

@@ -7,6 +7,7 @@ SQLite constraints and triggers remain the final integrity protection.
 from __future__ import annotations
 
 import re
+import sqlite3
 import unicodedata
 from dataclasses import dataclass
 from typing import Final
@@ -88,6 +89,7 @@ def create_entity(
     objective_reference_text: str | None = None,
     original_name: str | None = None,
     description: str | None = None,
+    connection: sqlite3.Connection | None = None,
 ) -> Entity:
     """Create an ENTITY in an explicitly chosen universe.
 
@@ -97,28 +99,26 @@ def create_entity(
 
     clean_name, normalized_name = _prepare_name(name)
     objective_reference_text = _empty_to_none(objective_reference_text)
-    with transaction() as connection:
-        _require_universe(connection, universe_id)
-        _require_objective_reference_for_homonym(
-            connection, universe_id, normalized_name, objective_reference_text
+    if connection is not None:
+        return _create_entity(
+            connection,
+            universe_id=universe_id,
+            name=clean_name,
+            normalized_name=normalized_name,
+            objective_reference_text=objective_reference_text,
+            original_name=original_name,
+            description=description,
         )
-        cursor = connection.execute(
-            """
-            INSERT INTO entity (
-                universe_id, name, normalized_name, objective_reference_text,
-                original_name, description, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-            """,
-            (
-                universe_id,
-                clean_name,
-                normalized_name,
-                objective_reference_text,
-                _empty_to_none(original_name),
-                _empty_to_none(description),
-            ),
+    with transaction() as transaction_connection:
+        return _create_entity(
+            transaction_connection,
+            universe_id=universe_id,
+            name=clean_name,
+            normalized_name=normalized_name,
+            objective_reference_text=objective_reference_text,
+            original_name=original_name,
+            description=description,
         )
-        return _require_entity(connection, cursor.lastrowid)
 
 
 def update_entity(
@@ -360,6 +360,41 @@ def list_structural_options(
 def _get_entity(connection, entity_id: int) -> Entity | None:
     row = connection.execute("SELECT * FROM entity WHERE entity_id = ?", (entity_id,)).fetchone()
     return Entity.from_row(row) if row is not None else None
+
+
+def _create_entity(
+    connection: sqlite3.Connection,
+    *,
+    universe_id: int,
+    name: str,
+    normalized_name: str,
+    objective_reference_text: str | None,
+    original_name: str | None,
+    description: str | None,
+) -> Entity:
+    """Create an ENTITY on a caller-owned or locally-owned transaction."""
+
+    _require_universe(connection, universe_id)
+    _require_objective_reference_for_homonym(
+        connection, universe_id, normalized_name, objective_reference_text
+    )
+    cursor = connection.execute(
+        """
+        INSERT INTO entity (
+            universe_id, name, normalized_name, objective_reference_text,
+            original_name, description, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+        """,
+        (
+            universe_id,
+            name,
+            normalized_name,
+            objective_reference_text,
+            _empty_to_none(original_name),
+            _empty_to_none(description),
+        ),
+    )
+    return _require_entity(connection, cursor.lastrowid)
 
 
 def _get_media(connection, media_id: int) -> Media | None:
